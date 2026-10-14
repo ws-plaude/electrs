@@ -72,12 +72,18 @@ impl Tracker {
     }
 
     pub(crate) fn sync(&mut self, daemon: &Daemon, exit_flag: &ExitFlag) -> Result<bool> {
-        let done = self.index.sync(daemon, exit_flag)?;
-        if done && !self.ignore_mempool {
+        loop {
+            let done = self.index.sync(daemon, exit_flag)?;
+            if !done || self.ignore_mempool {
+                return Ok(done);
+            }
             self.mempool.sync(daemon, exit_flag);
-            // TODO: double check tip - and retry on diff
+            // A block found during the mempool sync drops its txs from the mempool before the
+            // index has it: sync again, else they are reported in neither of them.
+            if daemon.get_best_block_hash()? == self.chain().tip() {
+                return Ok(true);
+            }
         }
-        Ok(done)
     }
 
     pub(crate) fn status(&self) -> Result<(), Error> {

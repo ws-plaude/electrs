@@ -226,6 +226,12 @@ impl Daemon {
             .tx)
     }
 
+    pub(crate) fn get_best_block_hash(&self) -> Result<BlockHash> {
+        self.rpc
+            .get_best_block_hash()
+            .context("failed to get best block hash")
+    }
+
     pub(crate) fn get_mempool_info(&self) -> Result<json::GetMempoolInfoResult> {
         self.rpc
             .get_mempool_info()
