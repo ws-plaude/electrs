@@ -292,12 +292,23 @@ impl Daemon {
         self.p2p.lock().get_new_headers(chain)
     }
 
-    pub(crate) fn for_blocks<B, F>(&self, blockhashes: B, func: F) -> Result<()>
+    /// Request and process the specified blocks (in the specified order).
+    /// Fetched over RPC: bitcoind silently ignores p2p requests for blocks out of its active chain
+    /// (e.g. just invalidated during a reorg), which would block us forever waiting for them.
+    pub(crate) fn for_blocks<B, F>(&self, blockhashes: B, mut func: F) -> Result<()>
     where
         B: IntoIterator<Item = BlockHash>,
         F: FnMut(BlockHash, SerBlock),
     {
-        self.p2p.lock().for_blocks(blockhashes, func)
+        for blockhash in blockhashes {
+            let block_hex = self
+                .rpc
+                .get_block_hex(&blockhash)
+                .with_context(|| format!("failed to get block {}", blockhash))?;
+            let block = Vec::from_hex(&block_hex).context("got non-hex block")?;
+            func(blockhash, block);
+        }
+        Ok(())
     }
 
     pub(crate) fn new_block_notification(&self) -> Receiver<()> {

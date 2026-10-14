@@ -17,23 +17,20 @@ use bitcoin::{
     secp256k1::{self, rand::Rng},
     Block, BlockHash,
 };
-use bitcoin_slices::{bsl, Parse};
 use crossbeam_channel::{bounded, select, Receiver, Sender};
 
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::types::SerBlock;
 use crate::{
     chain::{Chain, NewHeader},
     config::ELECTRS_VERSION,
-    metrics::{default_duration_buckets, default_size_buckets, Histogram, Metrics},
+    metrics::{default_duration_buckets, default_size_buckets, Metrics},
 };
 
 enum Request {
     GetNewHeaders(GetHeadersMessage),
-    GetBlocks(Vec<Inventory>),
 }
 
 impl Request {
@@ -43,24 +40,12 @@ impl Request {
             BlockHash::all_zeros(),
         ))
     }
-
-    fn get_blocks(blockhashes: &[BlockHash]) -> Request {
-        Request::GetBlocks(
-            blockhashes
-                .iter()
-                .map(|blockhash| Inventory::WitnessBlock(*blockhash))
-                .collect(),
-        )
-    }
 }
 
 pub(crate) struct Connection {
     req_send: Sender<Request>,
-    blocks_recv: Receiver<SerBlock>,
     headers_recv: Receiver<Vec<BlockHeader>>,
     new_block_recv: Receiver<()>,
-
-    blocks_duration: Histogram,
 }
 
 impl Connection {
@@ -88,46 +73,6 @@ impl Connection {
             .zip(new_heights)
             .map(NewHeader::from)
             .collect())
-    }
-
-    /// Request and process the specified blocks (in the specified order).
-    /// See https://en.bitcoin.it/wiki/Protocol_documentation#getblocks for details.
-    /// Defined as `&mut self` to prevent concurrent invocations (https://github.com/romanz/electrs/pull/526#issuecomment-934685515).
-    pub(crate) fn for_blocks<B, F>(&mut self, blockhashes: B, mut func: F) -> Result<()>
-    where
-        B: IntoIterator<Item = BlockHash>,
-        F: FnMut(BlockHash, SerBlock),
-    {
-        self.blocks_duration.observe_duration("total", || {
-            let blockhashes: Vec<BlockHash> = blockhashes.into_iter().collect();
-            if blockhashes.is_empty() {
-                return Ok(());
-            }
-            self.blocks_duration.observe_duration("request", || {
-                debug!("loading {} blocks", blockhashes.len());
-                self.req_send.send(Request::get_blocks(&blockhashes))
-            })?;
-
-            for hash in blockhashes {
-                let block = self.blocks_duration.observe_duration("response", || {
-                    let block = self
-                        .blocks_recv
-                        .recv()
-                        .with_context(|| format!("failed to get block {}", hash))?;
-                    let header = bsl::BlockHeader::parse(&block[..])
-                        .expect("core returned invalid blockheader")
-                        .parsed_owned();
-                    ensure!(
-                        &header.block_hash_sha2()[..] == hash.as_byte_array(),
-                        "got unexpected block"
-                    );
-                    Ok(block)
-                })?;
-                self.blocks_duration
-                    .observe_duration("process", || func(hash, block));
-            }
-            Ok(())
-        })
     }
 
     /// Note: only a single receiver will get the notification (https://github.com/romanz/electrs/pull/526#issuecomment-934687415).
@@ -168,12 +113,6 @@ impl Connection {
             "Size of p2p messages read (in bytes)",
             "message",
             default_size_buckets(),
-        );
-        let blocks_duration = metrics.histogram_vec(
-            "p2p_blocks_duration",
-            "Time spent getting blocks via p2p protocol (in seconds)",
-            "step",
-            default_duration_buckets(),
         );
 
         let mut buffer = vec![];
@@ -238,7 +177,6 @@ impl Connection {
         });
 
         let (req_send, req_recv) = bounded::<Request>(1);
-        let (blocks_send, blocks_recv) = bounded::<SerBlock>(10);
         let (headers_send, headers_recv) = bounded::<Vec<BlockHeader>>(1);
         let (new_block_send, new_block_recv) = bounded::<()>(0);
         let (init_send, init_recv) = bounded::<()>(0);
@@ -281,7 +219,6 @@ impl Connection {
                         ParsedNetworkMessage::Verack => {
                             init_send.send(())?; // peer acknowledged our version
                         }
-                        ParsedNetworkMessage::Block(block) => blocks_send.send(block)?,
                         ParsedNetworkMessage::Headers(headers) => headers_send.send(headers)?,
                         ParsedNetworkMessage::Ignored => (),
                     }
@@ -296,7 +233,6 @@ impl Connection {
                     };
                     let msg = match req {
                         Request::GetNewHeaders(msg) => NetworkMessage::GetHeaders(msg),
-                        Request::GetBlocks(inv) => NetworkMessage::GetData(inv),
                     };
                     tx_send.send(msg)?;
                 }
@@ -307,10 +243,8 @@ impl Connection {
 
         Ok(Connection {
             req_send,
-            blocks_recv,
             headers_recv,
             new_block_recv,
-            blocks_duration,
         })
     }
 }
@@ -350,7 +284,7 @@ impl RawNetworkMessage {
             "version" => ParsedNetworkMessage::Version(Decodable::consensus_decode(&mut raw)?),
             "verack" => ParsedNetworkMessage::Verack,
             "inv" => ParsedNetworkMessage::Inv(Decodable::consensus_decode(&mut raw)?),
-            "block" => ParsedNetworkMessage::Block(self.raw),
+            "block" => ParsedNetworkMessage::Ignored, // blocks are fetched over RPC
             "headers" => {
                 let len = VarInt::consensus_decode(&mut raw)?.0;
                 let mut headers = Vec::with_capacity(len as usize);
@@ -380,7 +314,6 @@ enum ParsedNetworkMessage {
     Inv(Vec<Inventory>),
     Ping(u64),
     Headers(Vec<BlockHeader>),
-    Block(SerBlock),
     Ignored,
 }
 
